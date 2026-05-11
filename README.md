@@ -12,8 +12,9 @@ A unified compression tool for Python, JavaScript, C/C++, Java, SVG, PNG, and ma
 | Generic Code | Token-level + Generic Tokenizer | `.js`, `.ts`, `.c`, `.cpp`, `.java`, `.go`, `.rs`, `.swift`, `.kt`, `.cs`, `.php`, `.rb`, `.sql`, `.sh`, ... |
 | SVG | Text Transformation (cleanup + simplify) | `.svg` |
 | PNG | K-Means Quantization + Color RLE V2 + LZMA | `.png` |
+| LaTeX/Markdown | Constant Substitution + LZMA | `.tex`, `.md` |
 
-**Supported languages**: JavaScript, TypeScript, C, C++, Java, C#, Go, Rust, Swift, Kotlin, PHP, Ruby, SQL, Bash, and more.
+**Supported languages**: JavaScript, TypeScript, C, C++, Java, C#, Go, Rust, Swift, Kotlin, PHP, Ruby, SQL, Bash, LaTeX, and more.
 
 ---
 
@@ -64,6 +65,9 @@ python encoder.py example.py
 # Multiple files
 python encoder.py file1.py file2.js file3.svg photo.png
 
+# LaTeX/Markdown files
+python encoder.py paper.tex notes.md
+
 # Directory (recursive)
 python encoder.py -d ./my_project -o ./output
 
@@ -96,14 +100,16 @@ This will automatically restore `util.py`, `encoder.py`, and `decoder.py` from e
 The `.compress` file structure:
 
 ```
-[4 bytes]  dict_len      -- Dictionary binary length
-[N bytes]  dict_data     -- Global mapping dictionary
-[2 bytes]  num_files     -- Number of files
+[4 bytes]  dict_len          -- Dictionary binary length (for code files)
+[N bytes]  dict_data         -- Global mapping dictionary
+[4 bytes]  latex_const_len   -- LaTeX constants table length
+[N bytes]  latex_const_data  -- LaTeX constant definitions
+[2 bytes]  num_files         -- Number of files
 For each file:
-  [2 bytes]  fname_len   -- Filename length
-[N bytes]  filename      -- Filename
-[1 byte]   file_type     -- 'p'=Python, 'c'=Code, 's'=SVG, 'g'=PNG
-[4 bytes]  stream_len    -- Stream length
+  [2 bytes]  fname_len       -- Filename length
+  [N bytes]  filename        -- Filename
+  [1 byte]   file_type       -- 'p'=Python, 'c'=Code, 's'=SVG, 'g'=PNG, 'l'=LaTeX
+  [4 bytes]  stream_len      -- Stream length
 [All streams concatenated]
 [LZMA compressed]
 ```
@@ -126,6 +132,14 @@ For each file:
 | `encode_png_to_stream(png_path, clusters)` | Encode PNG to RLE byte stream |
 | `decode_png_from_stream(png_stream)` | Decode RLE byte stream to PIL Image |
 | `detect_language(fname)` | Detect programming language from filename |
+| `replace_latex_constants(text)` | Replace LaTeX constants with short markers |
+| `restore_latex_constants(text, const_map)` | Restore LaTeX constants from markers |
+| `encode_latex_const_table(used_consts)` | Encode LaTeX constant table to bytes |
+| `decode_latex_const_table(data)` | Decode LaTeX constant table from bytes |
+
+### LaTeX Constant Substitution
+
+The LaTeX compression uses a predefined table of 44 high-frequency LaTeX expressions (integrals, sums, fractions, exponents, transforms, variables, etc.). During compression, only constants actually present in the files are stored in the constant table, making it efficient for any LaTeX content. The constant substitution is 100% lossless.
 
 ---
 
