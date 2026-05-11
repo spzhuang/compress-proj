@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+Decoder V7 - 统一解压缩工具（.py / .js / .svg / .png / 通用代码）
+
+根据文件类型自动选择解码方法：
+  'p' -> Token 级解压 + 源码还原 (Python)
+  'c' -> Token 级解压 + 源码还原 (通用代码 JS/C++/Java/Go/Rust...)
+  's' -> 直接 UTF-8 解码（SVG 为文本变换压缩）
+  'g' -> K-Means + Color RLE V2 解压为 PNG
+
+Usage:
+    python decoder.py <input.compress> [output_dir]
+"""
+
+import sys
+import os
+import re
+import struct
+import tokenize
+import keyword
+import lzma
+import argparse
+from pathlib import Path
+
+from util import (
+    generate_short_names, get_index_bytes, read_index,
+    decode_png_from_stream,
+)
+
+
+# ============================================================
+#  Python 解码器
+# ============================================================
+
+def decode_dict(data):
+    """从紧凑二进制解码映射字典"""
+    pos = 0
+    mapping = {"v": "6"}
+
+    for key_char, key_name in [('k', 'kw'), ('b', 'bi'), ('o', 'op'), ('n', 'nu')]:
+        assert data[pos] == ord(key_char)
+        count = struct.unpack('>H', data[pos+1:pos+3])[0]
+        pos += 3
+        items = []
+        for _ in range(count):
+            slen = struct.unpack('>H', data[pos:pos+2])[0]
+            pos += 2
+            items.append(data[pos:pos+slen].decode('utf-8'))
+            pos += slen
+        mapping[key_name] = items
+
+    assert data[pos] == ord('i')
+    count = struct.unpack('>H', data[pos+1:pos+3])[0]
+    pos += 3
+    id_list = []
+    for _ in range(count):
+        orig_len = struct.unpack('>H', data[pos:pos+2])[0]
+        pos += 2
+        id_list.append(data[pos:pos+orig_len].decode('utf-8'))
+        pos += orig_len
+
+    short_names = generate_short_names(len(id_list))
+    id_map = {}
+    for i, orig in enumerate(id_list):
+        id_map[short_names[i]] = orig
+    mapping['id'] = id_map
+
+    assert data[pos] == ord('s')
+    count = struct.unpack('>H', data[pos+1:pos+3])[0]
+    pos += 3
+    st_list = []
+    for _ in range(count):
+        orig_len = struct.unpack('>H', data[pos:pos+2])[0]
+        pos += 2
+        st_list.append(data[pos:pos+orig_len].decode('utf-8'))
+        pos += orig_len
+
+    st_map = {}
+    for i, orig in enumerate(st_list):
+        st_map[f"s{i}"] = orig
+    mapping['st'] = st_map
+
+    return mapping
+
+
+def decode_stream_to_lines(encoded, mapping):
+    """解码字节流为 [(indent, [tokens]), ...]"""
+    kw_list = mapping['kw']
+    bi_list = mapping['bi']
+    op_list = mapping['op']
+    nu_list = mapping['nu']
+    id_list = [orig for short, orig in mapping['id'].items()]
+    st_list = [orig for short, orig in mapping['st'].items()]
+
+    kw_b = get_index_bytes(len(kw_list))
+    bi_b = get_index_bytes(len(bi_list))
+    op_b = get_index_bytes(len(op_list))
+    nu_b = get_index_bytes(len(nu_list))
+    id_b = get_index_bytes(len(id_list))
+    st_b = get_index_bytes(len(st_list))
+
+    lines = []
+    tokens = []
+    current_indent = 0
+    pos = 0
+
+    while pos < len(encoded):
+        b = encoded[pos]
+
+        if b == 0xFF or b >= 0x80:
+            if tokens:
+                lines.append((current_indent, tokens))
+                tokens = []
+            if b >= 0x80 and b != 0xFF:
+                current_indent = b - 0x80
+            pos += 1
+        else:
+            tc = chr(b)
+            pos += 1
+
+            if tc == 'k':
+                idx, pos = read_index(encoded, pos, kw_b)
+                tokens.append((tokenize.NAME, kw_list[idx]))
+            elif tc == 'b':
+                idx, pos = read_index(encoded, pos, bi_b)
+                tokens.append((tokenize.NAME, bi_list[idx]))
+            elif tc == 'o':
+                idx, pos = read_index(encoded, pos, op_b)
+                tokens.append((tokenize.OP, op_list[idx]))
+            elif tc == 'i':
+                idx, pos = read_index(encoded, pos, id_b)
+                tokens.append((tokenize.NAME, id_list[idx]))
+            elif tc == 's':
+                idx, pos = read_index(encoded, pos, st_b)
+                tokens.append((tokenize.STRING, st_list[idx]))
+            elif tc == 'n':
+                idx, pos = read_index(encoded, pos, nu_b)
+                tokens.append((tokenize.NUMBER, nu_list[idx]))
+            elif tc == 'r':
+                slen = struct.unpack('>H', encoded[pos:pos+2])[0]
+                pos += 2
+                s = encoded[pos:pos+slen].decode('utf-8')
+                pos += slen
+                tokens.append((tokenize.NAME, s))
+
+    if tokens:
+        lines.append((current_indent, tokens))
+
+    return lines
+
+
+def restore_from_lines(lines):
+    """从行列表还原 Python 源代码"""
+    result = []
+
+    for indent, tokens in lines:
+        if indent > 0:
+            result.append(' ' * indent)
+
+        prev_type = None
+        prev_str = None
+
+        for ttype, tstr in tokens:
+            need_space = False
+
+            if prev_type is not None:
+                if prev_type in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING) and \
+                   ttype in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING):
+                    need_space = True
+
+                if prev_type == tokenize.NAME and prev_str in keyword.kwlist:
+                    if ttype not in (tokenize.OP, tokenize.NEWLINE, tokenize.NL):
+                        need_space = True
+                    if ttype == tokenize.OP and tstr in ('(', '[', '{'):
+                        need_space = False
+
+                if ttype == tokenize.OP and tstr in ('=', '+=', '-=', '*=', '/=', '//=', '%=', '**=', ':='):
+                    need_space = True
+                if prev_type == tokenize.OP and prev_str in ('=', '+=', '-=', '*=', '/=', '//=', '%=', '**=', ':='):
+                    need_space = True
+
+                if ttype == tokenize.OP and tstr in ('==', '!=', '<=', '>=', '<', '>'):
+                    need_space = True
+                if prev_type == tokenize.OP and prev_str in ('==', '!=', '<=', '>=', '<', '>'):
+                    need_space = True
+
+                if prev_type == tokenize.OP and prev_str == ',':
+                    if ttype not in (tokenize.OP, tokenize.NEWLINE, tokenize.NL) or \
+                       (ttype == tokenize.OP and tstr not in (')', ']', '}')):
+                        need_space = True
+
+                if prev_type == tokenize.OP and prev_str == ':':
+                    if ttype not in (tokenize.NEWLINE, tokenize.NL, tokenize.COMMENT):
+                        if not (ttype == tokenize.OP and tstr in (')', ']', '}', ',')):
+                            need_space = True
+
+                if prev_type == tokenize.OP and prev_str in (')', ']', '}'):
+                    if ttype in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING):
+                        need_space = True
+
+            if need_space:
+                result.append(' ')
+
+            result.append(tstr)
+            prev_type = ttype
+            prev_str = tstr
+
+        result.append('\n')
+
+    return ''.join(result)
+
+
+# ============================================================
+#  通用代码解码器（类 C 语法还原）
+# ============================================================
+
+# 类 C 语言关键字集合
+_KEYWORD_NEED_SPACE_AFTER = {
+    'if', 'else', 'for', 'while', 'switch', 'case', 'return', 'throw',
+    'catch', 'try', 'finally', 'do', 'yield', 'await', 'async', 'new',
+    'delete', 'typeof', 'instanceof', 'void', 'in', 'of', 'as', 'from',
+    'import', 'export', 'extends', 'implements', 'class', 'interface',
+    'enum', 'struct', 'union', 'typedef', 'namespace', 'using', 'template',
+    'public', 'private', 'protected', 'static', 'const', 'let', 'var',
+    'function', 'def', 'fn', 'func', 'fun', 'type', 'alias', 'declare',
+    'abstract', 'virtual', 'override', 'final', 'mutable', 'volatile',
+    'throws', 'throw', 'goto', 'break', 'continue', 'lazy', 'defer',
+    'guard', 'where', 'until', 'unless', 'elsif', 'elif',
+    'match', 'with', 'lambda', 'assert', 'raise', 'except', 'rescue',
+    'ensure', 'module', 'package',
+}
+
+# 关键字后跟 `{` 时需要空格（如 import/export/from 后的解构语法）
+_KEYWORD_SPACE_BEFORE_BRACE = {'import', 'export', 'from', 'as'}
+
+# 二元运算符前后需要空格
+_BINARY_OPS = {
+    '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
+    '<<=', '>>=', '>>>',
+    '+', '-', '*', '/', '%',
+    '&&', '||', '&', '|', '^', '<<', '>>', '>>>',
+    '==', '!=', '===', '!==', '<', '>', '<=', '>=',
+    '=>', '->',
+}
+
+def restore_generic_lines(lines):
+    """
+    从行列表还原类 C 语言源代码。
+
+    根据类 C 语法规则在 token 之间插入适当的空格。
+    保留原始的缩进信息。
+    """
+    result = []
+
+    for indent, tokens in lines:
+        if indent > 0:
+            result.append(' ' * indent)
+
+        prev_type = None
+        prev_str = None
+
+        for ttype, tstr in tokens:
+            need_space = False
+
+            if prev_type is not None:
+                # === 基本规则 ===
+
+                # R1: 相邻的 NAME/NUMBER/STRING 之间需要空格
+                if prev_type in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING) and \
+                   ttype in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING):
+                    need_space = True
+
+                # R2: 关键字后跟标识符/字符串/数字通常需要空格
+                if prev_type == tokenize.NAME and prev_str in _KEYWORD_NEED_SPACE_AFTER:
+                    if ttype == tokenize.OP and tstr == '(':
+                        # 关键字后跟 ( : if( / for( 格式都可以，不加空格
+                        need_space = False
+                    elif ttype == tokenize.OP and tstr == '{':
+                        # 关键字后跟 { : import { 需要空格
+                        if prev_str in _KEYWORD_SPACE_BEFORE_BRACE:
+                            need_space = True
+                        else:
+                            need_space = False
+                    elif ttype == tokenize.OP:
+                        # 关键字后跟其他运算符: 通常需要空格（但 . :: < > 不需要）
+                        if tstr not in ('.', '::', '<', '>', '[', ']', '(', ')', ';', ',', '{'):
+                            need_space = True
+                    else:
+                        need_space = True
+
+                # R3: 二元运算符前后需要空格（但 . :: 前后永远不需要）
+                # 注意: < > 在 include/pragma 后由 R13 处理，这里排除
+                if ttype == tokenize.OP and tstr in _BINARY_OPS and tstr not in ('<', '>'):
+                    if prev_type == tokenize.OP and prev_str in ('.', '::', '(', '[', '{', '@'):
+                        need_space = False
+                    else:
+                        need_space = True
+                if prev_type == tokenize.OP and prev_str in _BINARY_OPS and prev_str not in ('<', '>'):
+                    if ttype == tokenize.OP and tstr in ('.', '::', ')', ']', '}', ',', ';', ':'):
+                        need_space = False
+                    else:
+                        need_space = True
+
+                # R4: 逗号后通常需要空格（除非下一个是 ) ] }）
+                if prev_type == tokenize.OP and prev_str == ',':
+                    if ttype == tokenize.OP and tstr in (')', ']', '}'):
+                        need_space = False
+                    else:
+                        need_space = True
+
+                # R5: 冒号: 对象字面量 key: value 需要空格；三元运算符 ? a : b 需要空格
+                if prev_type == tokenize.OP and prev_str == ':':
+                    if ttype == tokenize.OP and tstr in (')', ']', '}', ','):
+                        need_space = False
+                    else:
+                        need_space = True
+
+                # R6: 分号后需要空格
+                if prev_type == tokenize.OP and prev_str == ';':
+                    need_space = True
+
+                # R7: ) ] } 后跟 NAME/NUMBER/STRING 通常需要空格
+                if prev_type == tokenize.OP and prev_str in (')', ']', '}'):
+                    if ttype in (tokenize.NAME, tokenize.NUMBER, tokenize.STRING):
+                        if not (ttype == tokenize.OP and tstr == '.'):
+                            need_space = True
+
+                # R8: . 和 :: 前后永远不需要空格
+                if ttype == tokenize.OP and tstr in ('.', '::'):
+                    need_space = False
+                if prev_type == tokenize.OP and prev_str in ('.', '::'):
+                    need_space = False
+
+                # R9: 链式调用: )(. )[. }(. ]( 等不需要空格
+                if ttype == tokenize.OP and tstr == '(':
+                    if prev_type == tokenize.OP and prev_str in (')', ']'):
+                        need_space = False
+                if ttype == tokenize.OP and tstr == '.':
+                    if prev_type == tokenize.OP and prev_str in (')', ']'):
+                        need_space = False
+
+                # R10: NAME 后跟 ( 不需要空格（函数调用）
+                if ttype == tokenize.OP and tstr == '(':
+                    if prev_type == tokenize.NAME:
+                        if prev_str not in _KEYWORD_NEED_SPACE_AFTER:
+                            need_space = False
+
+                # R11: @ 前需要空格（装饰器语法）
+                if ttype == tokenize.OP and tstr == '@':
+                    need_space = True
+
+                # R12: # 在 C 预处理中紧跟标识符不需要空格
+                if ttype == tokenize.NAME:
+                    if prev_type == tokenize.OP and prev_str == '#':
+                        need_space = False
+
+                # R13: include/pragma 后的 < 和 > 不需要空格（覆盖 R3）
+                # 也覆盖 #include <iostream> 中头文件名后的 >
+                if ttype == tokenize.OP and tstr in ('<', '>'):
+                    if prev_str and ('include' in prev_str or 'pragma' in prev_str):
+                        need_space = False
+                    elif tstr == '>' and prev_type == tokenize.NAME:
+                        # 检查是否在 #include <...> 的上下文中（简化：> 紧跟 NAME 时不加空格）
+                        need_space = False
+
+            result.append(' ' if need_space else '')
+            result.append(tstr)
+            prev_type = ttype
+            prev_str = tstr
+
+        result.append('\n')
+
+    return ''.join(result)
+
+
+# ============================================================
+#  统一解包
+# ============================================================
+
+def decode_files(compress_path):
+    """
+    从压缩文件解码所有源文件。
+
+    Returns:
+        dict: {filename: (file_type, content)}
+            file_type: 'source'  -> str (Python/SVG source)
+                       'image'   -> PIL Image (PNG)
+    """
+    with open(compress_path, 'rb') as f:
+        compressed = f.read()
+
+    decompressed = lzma.decompress(compressed)
+    dict_len = struct.unpack('>I', decompressed[:4])[0]
+
+    if dict_len > 0:
+        mapping = decode_dict(decompressed[4:4+dict_len])
+    else:
+        mapping = None
+
+    data_start = 4 + dict_len
+    pos = data_start
+    num_files = struct.unpack('>H', decompressed[pos:pos+2])[0]
+    pos += 2
+
+    file_headers = []
+    for i in range(num_files):
+        fname_len = struct.unpack('>H', decompressed[pos:pos+2])[0]
+        pos += 2
+        fname = decompressed[pos:pos+fname_len].decode('utf-8')
+        pos += fname_len
+        file_type = chr(decompressed[pos])
+        pos += 1
+        stream_len = struct.unpack('>I', decompressed[pos:pos+4])[0]
+        pos += 4
+        file_headers.append((fname, file_type, stream_len))
+
+    results = {}
+    for fname, file_type, stream_len in file_headers:
+        encoded = decompressed[pos:pos+stream_len]
+        pos += stream_len
+
+        if file_type == 'p':
+            lines = decode_stream_to_lines(encoded, mapping)
+            source = restore_from_lines(lines)
+            results[fname] = ('source', source)
+        elif file_type == 'c':
+            lines = decode_stream_to_lines(encoded, mapping)
+            source = restore_generic_lines(lines)
+            results[fname] = ('source', source)
+        elif file_type == 's':
+            source = encoded.decode('utf-8')
+            results[fname] = ('source', source)
+        elif file_type == 'g':
+            image = decode_png_from_stream(encoded)
+            results[fname] = ('image', image)
+        else:
+            raise ValueError(f"未知文件类型: {file_type}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Decoder V7 - 统一解压缩 (PY/JS/C++/JAVA/SVG/PNG)'
+    )
+    parser.add_argument('input', help='输入 .compress 文件路径')
+    parser.add_argument('output', nargs='?', default='output',
+                        help='输出目录（默认: ./output）')
+
+    args = parser.parse_args()
+
+    compress_path = Path(args.input)
+    if not compress_path.exists():
+        print(f"Error: 文件不存在 {compress_path}")
+        sys.exit(1)
+
+    output_base = Path(args.output)
+
+    results = decode_files(compress_path)
+
+    if len(results) > 1:
+        output_dir = output_base / compress_path.stem
+    else:
+        output_dir = output_base
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*50}")
+    print("   Decompression Results")
+    print(f"{'='*50}")
+
+    for fname, (ftype, content) in results.items():
+        out_path = output_dir / fname
+
+        if ftype == 'source':
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            ext = Path(fname).suffix.lower()
+            if ext == '.py':
+                tag = '[PY]'
+            elif ext in ('.svg',):
+                tag = '[SVG]'
+            else:
+                tag = f'[{ext.lstrip(".")}]'
+            print(f"  {tag:<8s} {fname} -> {out_path} ({len(content)} chars)")
+        elif ftype == 'image':
+            content.save(out_path, optimize=True)
+            print(f"  [PNG]    {fname} -> {out_path} ({content.size[0]}x{content.size[1]})")
+
+    print(f"{'='*50}")
+    print(f"Done. All files restored to: {output_dir}")
+
+
+if __name__ == '__main__':
+    main()
