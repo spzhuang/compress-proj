@@ -25,6 +25,7 @@ from pathlib import Path
 from util import (
     generate_short_names, get_index_bytes, read_index,
     decode_png_from_stream,
+    restore_latex_constants, decode_latex_const_table,
 )
 
 
@@ -383,22 +384,35 @@ def decode_files(compress_path):
 
     Returns:
         dict: {filename: (file_type, content)}
-            file_type: 'source'  -> str (Python/SVG source)
+            file_type: 'source'  -> str (Python/SVG/LaTeX source)
                        'image'   -> PIL Image (PNG)
     """
     with open(compress_path, 'rb') as f:
         compressed = f.read()
 
     decompressed = lzma.decompress(compressed)
-    dict_len = struct.unpack('>I', decompressed[:4])[0]
+    pos = 0
+
+    # 1. 代码字典
+    dict_len = struct.unpack('>I', decompressed[pos:pos+4])[0]
+    pos += 4
 
     if dict_len > 0:
-        mapping = decode_dict(decompressed[4:4+dict_len])
+        mapping = decode_dict(decompressed[pos:pos+dict_len])
     else:
         mapping = None
+    pos += dict_len
 
-    data_start = 4 + dict_len
-    pos = data_start
+    # 2. LaTeX 常量表
+    latex_const_len = struct.unpack('>I', decompressed[pos:pos+4])[0]
+    pos += 4
+
+    latex_const_map = {}
+    if latex_const_len > 0:
+        latex_const_map = decode_latex_const_table(decompressed[pos:pos+latex_const_len])
+    pos += latex_const_len
+
+    # 3. 文件数量
     num_files = struct.unpack('>H', decompressed[pos:pos+2])[0]
     pos += 2
 
@@ -433,6 +447,11 @@ def decode_files(compress_path):
         elif file_type == 'g':
             image = decode_png_from_stream(encoded)
             results[fname] = ('image', image)
+        elif file_type == 'l':
+            text = encoded.decode('utf-8')
+            if latex_const_map:
+                text = restore_latex_constants(text, latex_const_map)
+            results[fname] = ('source', text)
         else:
             raise ValueError(f"未知文件类型: {file_type}")
 
@@ -478,8 +497,12 @@ def main():
             ext = Path(fname).suffix.lower()
             if ext == '.py':
                 tag = '[PY]'
-            elif ext in ('.svg',):
+            elif ext == '.svg':
                 tag = '[SVG]'
+            elif ext == '.tex':
+                tag = '[TEX]'
+            elif ext == '.md':
+                tag = '[MD]'
             else:
                 tag = f'[{ext.lstrip(".")}]'
             print(f"  {tag:<8s} {fname} -> {out_path} ({len(content)} chars)")
