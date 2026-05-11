@@ -30,6 +30,7 @@ from pathlib import Path
 from util import (
     generate_short_names, get_index_bytes, pack_index,
     encode_png_to_stream, CODE_EXTENSIONS, BUILTINS_MAP, LANGUAGE_MAP,
+    replace_latex_constants, encode_latex_const_table,
 )
 
 
@@ -604,19 +605,55 @@ def encode_png_files(sources, clusters=16):
 
 
 # ============================================================
+#  LaTeX 编码器（常量替换）
+# ============================================================
+
+def encode_latex_files(sources):
+    """
+    编码 LaTeX/Markdown 文件：常量替换 + 收集使用的常量。
+
+    Args:
+        sources: {fname: text_content}
+
+    Returns:
+        (encoded_streams, used_consts)
+        encoded_streams: {fname: replaced_bytes}
+        used_consts: {marker: (orig, count)}
+    """
+    encoded_streams = {}
+    all_used = {}
+
+    for fname, text in sources.items():
+        replaced, used = replace_latex_constants(text)
+        encoded_streams[fname] = replaced.encode('utf-8')
+
+        for marker, info in used.items():
+            if marker not in all_used:
+                all_used[marker] = info
+            else:
+                all_used[marker] = (info[0], all_used[marker][1] + info[1])
+
+    return encoded_streams, all_used
+
+
+# ============================================================
 #  统一打包与输出
 # ============================================================
 
-def pack_all_files(py_sources, code_sources, svg_sources, png_sources, output_path, png_clusters=16):
+def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sources,
+                   output_path, png_clusters=16):
     """
     统一打包格式：
-    [4] dict_len | [dict_len] dict_data | [2] num_files |
+    [4] dict_len | [dict_len] dict_data |
+    [4] latex_const_len | [latex_const_len] latex_const_data |
+    [2] num_files |
     对于每个文件:
         [2] fname_len | [fname_len] filename | [1] file_type | [4] stream_len |
     [all streams concatenated]
     [lzma compressed]
 
     file_type: 'p' = Python, 'c' = Code (generic), 's' = SVG, 'g' = PNG (Graphic)
+               'l' = LaTeX/Markdown
     """
     # 构建联合源数据（如果有多种代码类型）
     all_code_sources = {}
@@ -625,20 +662,20 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, output_pa
     if code_sources:
         for fname, (source, kw_set, bi_set) in code_sources.items():
             all_code_sources[fname] = (source, kw_set, bi_set)
-    
+
     # 如果同时有 Python 和通用代码，需要分别构建各自的字典
     # 但统一使用一个字典（Python 的 tokenizer 优先级更高）
     mapping = None
     dict_binary = b''
     py_encoded = {}
     code_encoded = {}
-    
+
     if py_sources and code_sources:
         # 两者都有：使用 Python 字典 + code-only 的额外条目
         # 先用各自的方法构建字典
         py_mapping = build_mapping_dict(py_sources)
         code_mapping = build_generic_mapping_dict(code_sources)
-        
+
         # 合并字典（Python 的条目在前）
         merged = {"v": "7"}
         for key in ['kw', 'bi', 'op', 'nu']:
@@ -653,20 +690,20 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, output_pa
         py_st = list(py_mapping['st'].values())
         code_st = list(code_mapping['st'].values())
         merged['st'] = {f"s{i}": s for i, s in enumerate(py_st + code_st)}
-        
+
         mapping = merged
         dict_binary = encode_dict(mapping)
-        
+
         # 用合并字典重新编码所有文件（Python 文件不需要偏移，因为 Python 的条目在前）
         py_encoded = encode_python_files(py_sources, mapping)
         code_encoded = encode_generic_files(code_sources, mapping)
-        
+
     elif py_sources:
         # 只有 Python
         mapping = build_mapping_dict(py_sources)
         dict_binary = encode_dict(mapping)
         py_encoded = encode_python_files(py_sources, mapping)
-        
+
     elif code_sources:
         # 只有通用代码
         mapping = build_generic_mapping_dict(code_sources)
@@ -682,13 +719,26 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, output_pa
     if png_sources:
         png_encoded, png_psnr = encode_png_files(png_sources, clusters=png_clusters)
 
+    # LaTeX 编码
+    latex_encoded = {}
+    latex_const_binary = b''
+    if latex_sources:
+        latex_encoded, latex_used = encode_latex_files(latex_sources)
+        if latex_used:
+            latex_const_binary = encode_latex_const_table(latex_used)
+
     # 统一打包
-    all_encoded = {**py_encoded, **code_encoded, **svg_encoded, **png_encoded}
+    all_encoded = {**py_encoded, **code_encoded, **svg_encoded, **png_encoded, **latex_encoded}
     num_files = len(all_encoded)
 
     merged = bytearray()
+    # 1. 代码字典 (4字节长度 + 数据)
     merged.extend(struct.pack('>I', len(dict_binary)))
     merged.extend(dict_binary)
+    # 2. LaTeX 常量表 (4字节长度 + 数据)
+    merged.extend(struct.pack('>I', len(latex_const_binary)))
+    merged.extend(latex_const_binary)
+    # 3. 文件数量
     merged.extend(struct.pack('>H', num_files))
 
     stream_data = bytearray()
@@ -705,6 +755,8 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, output_pa
             merged.append(ord('s'))
         elif fname.lower().endswith('.png'):
             merged.append(ord('g'))
+        elif fname.endswith('.tex') or fname.endswith('.md'):
+            merged.append(ord('l'))
         else:
             merged.append(ord('?'))
 
@@ -751,7 +803,7 @@ def main():
         return
 
     # 收集源文件
-    supported_exts = ('.py', '.svg', '.png') + tuple(CODE_EXTENSIONS)
+    supported_exts = ('.py', '.svg', '.png', '.tex', '.md') + tuple(CODE_EXTENSIONS)
 
     if args.directory:
         input_path = Path(args.directory)
@@ -801,6 +853,8 @@ def main():
     py_sources = {k: v for k, v in all_files.items() if k.endswith('.py')}
     svg_sources = {k: v for k, v in all_files.items() if k.endswith('.svg')}
     png_sources = {k: v for k, v in all_files.items() if k.lower().endswith('.png')}
+    latex_sources = {k: v for k, v in all_files.items()
+                     if k.endswith('.tex') or k.endswith('.md')}
 
     # 通用代码文件分组
     code_sources = {}
@@ -821,7 +875,7 @@ def main():
 
     # 打包
     compressed, png_psnr = pack_all_files(
-        py_sources, code_sources, svg_sources, png_sources,
+        py_sources, code_sources, svg_sources, png_sources, latex_sources,
         output_path, png_clusters=args.clusters
     )
 
@@ -851,6 +905,8 @@ def main():
     if png_sources:
         for fname, psnr in png_psnr.items():
             print(f"  PNG:    {fname} (PSNR={psnr:.1f}dB, K={args.clusters})")
+    if latex_sources:
+        print(f"  LaTeX:  {len(latex_sources)} files")
     print(f"{'='*50}")
 
 
