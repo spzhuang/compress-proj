@@ -31,6 +31,7 @@ from util import (
     generate_short_names, get_index_bytes, pack_index,
     encode_png_to_stream, CODE_EXTENSIONS, BUILTINS_MAP, LANGUAGE_MAP,
     replace_latex_constants, encode_latex_const_table,
+    encode_md_stream, encode_md_pattern_table,
 )
 
 
@@ -637,15 +638,52 @@ def encode_latex_files(sources):
 
 
 # ============================================================
+#  Markdown 编码器（分块压缩）
+# ============================================================
+
+def encode_md_files(sources, code_mapping=None):
+    """
+    编码 Markdown 文件：分块压缩（代码块用代码压缩器，Math用LaTeX替换，表格特殊压缩，纯文本用模式替换）。
+
+    Args:
+        sources: {fname: text_content}
+        code_mapping: 全局代码字典（用于代码块token压缩）
+
+    Returns:
+        (encoded_streams, md_const_binary)
+        encoded_streams: {fname: encoded_bytes}
+        md_const_binary: MD模式常量表
+    """
+    encoded_streams = {}
+    all_md_used = {}
+
+    for fname, text in sources.items():
+        encoded, md_used = encode_md_stream(text, code_mapping=code_mapping)
+        encoded_streams[fname] = encoded
+
+        # md_used 是 dict {marker: (orig, count)}
+        if isinstance(md_used, dict):
+            for marker, info in md_used.items():
+                if marker not in all_md_used:
+                    all_md_used[marker] = info
+                else:
+                    all_md_used[marker] = (info[0], all_md_used[marker][1] + info[1])
+
+    md_const_binary = encode_md_pattern_table(all_md_used) if all_md_used else b''
+    return encoded_streams, md_const_binary
+
+
+# ============================================================
 #  统一打包与输出
 # ============================================================
 
 def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sources,
-                   output_path, png_clusters=16):
+                   md_sources, output_path, png_clusters=16):
     """
     统一打包格式：
     [4] dict_len | [dict_len] dict_data |
     [4] latex_const_len | [latex_const_len] latex_const_data |
+    [4] md_const_len | [md_const_len] md_const_data |
     [2] num_files |
     对于每个文件:
         [2] fname_len | [fname_len] filename | [1] file_type | [4] stream_len |
@@ -653,7 +691,7 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
     [lzma compressed]
 
     file_type: 'p' = Python, 'c' = Code (generic), 's' = SVG, 'g' = PNG (Graphic)
-               'l' = LaTeX/Markdown
+               'l' = LaTeX, 'm' = Markdown (分块压缩)
     """
     # 构建联合源数据（如果有多种代码类型）
     all_code_sources = {}
@@ -727,8 +765,14 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
         if latex_used:
             latex_const_binary = encode_latex_const_table(latex_used)
 
+    # Markdown 编码（分块压缩）
+    md_encoded = {}
+    md_const_binary = b''
+    if md_sources:
+        md_encoded, md_const_binary = encode_md_files(md_sources, code_mapping=mapping)
+
     # 统一打包
-    all_encoded = {**py_encoded, **code_encoded, **svg_encoded, **png_encoded, **latex_encoded}
+    all_encoded = {**py_encoded, **code_encoded, **svg_encoded, **png_encoded, **latex_encoded, **md_encoded}
     num_files = len(all_encoded)
 
     merged = bytearray()
@@ -738,7 +782,10 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
     # 2. LaTeX 常量表 (4字节长度 + 数据)
     merged.extend(struct.pack('>I', len(latex_const_binary)))
     merged.extend(latex_const_binary)
-    # 3. 文件数量
+    # 3. MD 模式常量表 (4字节长度 + 数据)
+    merged.extend(struct.pack('>I', len(md_const_binary)))
+    merged.extend(md_const_binary)
+    # 4. 文件数量
     merged.extend(struct.pack('>H', num_files))
 
     stream_data = bytearray()
@@ -755,8 +802,11 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
             merged.append(ord('s'))
         elif fname.lower().endswith('.png'):
             merged.append(ord('g'))
-        elif fname.endswith('.tex') or fname.endswith('.md'):
+        elif fname.endswith('.tex'):
             merged.append(ord('l'))
+        elif fname in md_sources:
+            # .md 和 .txt 都使用分块压缩
+            merged.append(ord('m'))
         else:
             merged.append(ord('?'))
 
@@ -803,7 +853,7 @@ def main():
         return
 
     # 收集源文件
-    supported_exts = ('.py', '.svg', '.png', '.tex', '.md') + tuple(CODE_EXTENSIONS)
+    supported_exts = ('.py', '.svg', '.png', '.tex', '.md', '.txt') + tuple(CODE_EXTENSIONS)
 
     if args.directory:
         input_path = Path(args.directory)
@@ -853,8 +903,8 @@ def main():
     py_sources = {k: v for k, v in all_files.items() if k.endswith('.py')}
     svg_sources = {k: v for k, v in all_files.items() if k.endswith('.svg')}
     png_sources = {k: v for k, v in all_files.items() if k.lower().endswith('.png')}
-    latex_sources = {k: v for k, v in all_files.items()
-                     if k.endswith('.tex') or k.endswith('.md')}
+    latex_sources = {k: v for k, v in all_files.items() if k.endswith('.tex')}
+    md_sources = {k: v for k, v in all_files.items() if k.endswith('.md') or k.endswith('.txt')}
 
     # 通用代码文件分组
     code_sources = {}
@@ -876,7 +926,7 @@ def main():
     # 打包
     compressed, png_psnr = pack_all_files(
         py_sources, code_sources, svg_sources, png_sources, latex_sources,
-        output_path, png_clusters=args.clusters
+        md_sources, output_path, png_clusters=args.clusters
     )
 
     # 统计（按扩展名区分内容和路径）
@@ -907,8 +957,11 @@ def main():
             print(f"  PNG:    {fname} (PSNR={psnr:.1f}dB, K={args.clusters})")
     if latex_sources:
         print(f"  LaTeX:  {len(latex_sources)} files")
+    if md_sources:
+        print(f"  MD:     {len(md_sources)} files (block-level compression)")
     print(f"{'='*50}")
 
 
 if __name__ == '__main__':
     main()
+

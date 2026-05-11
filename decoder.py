@@ -26,6 +26,7 @@ from util import (
     generate_short_names, get_index_bytes, read_index,
     decode_png_from_stream,
     restore_latex_constants, decode_latex_const_table,
+    decode_md_stream, decode_md_pattern_table, restore_md_patterns,
 )
 
 
@@ -412,7 +413,16 @@ def decode_files(compress_path):
         latex_const_map = decode_latex_const_table(decompressed[pos:pos+latex_const_len])
     pos += latex_const_len
 
-    # 3. 文件数量
+    # 3. MD 模式常量表
+    md_const_len = struct.unpack('>I', decompressed[pos:pos+4])[0]
+    pos += 4
+
+    md_pattern_map = {}
+    if md_const_len > 0:
+        md_pattern_map = decode_md_pattern_table(decompressed[pos:pos+md_const_len])
+    pos += md_const_len
+
+    # 4. 文件数量
     num_files = struct.unpack('>H', decompressed[pos:pos+2])[0]
     pos += 2
 
@@ -451,6 +461,10 @@ def decode_files(compress_path):
             text = encoded.decode('utf-8')
             if latex_const_map:
                 text = restore_latex_constants(text, latex_const_map)
+            results[fname] = ('source', text)
+        elif file_type == 'm':
+            # Markdown 分块压缩解码
+            text = decode_md_stream(encoded, md_pattern_map=md_pattern_map, latex_const_map=latex_const_map)
             results[fname] = ('source', text)
         else:
             raise ValueError(f"未知文件类型: {file_type}")
@@ -516,3 +530,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
