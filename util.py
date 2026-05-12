@@ -1007,13 +1007,20 @@ def _extract_dynamic_patterns(text, max_patterns=100):
     return candidates[:max_patterns]
 
 
-def replace_md_patterns(text):
+def replace_md_patterns(text, dyn_start_idx=0):
     """
     替换 Markdown 文本中的高频模式。
     先使用静态词表，再使用动态提取的高频模式。
 
+    Args:
+        text: 输入文本
+        dyn_start_idx: 动态标记起始索引（多文件压缩时使用不同起始值避免冲突）
+
     Returns:
-        replaced_text, used_patterns dict {marker: (orig, count)}
+        (replaced_text, used_patterns, next_dyn_idx)
+        replaced_text: 替换后的文本
+        used_patterns: dict {marker: (orig, count)}
+        next_dyn_idx: 下一个可用的动态标记索引
     """
     used = {}
     result = text
@@ -1031,10 +1038,10 @@ def replace_md_patterns(text):
     
     # 2. 使用动态提取的高频模式
     dynamic = _extract_dynamic_patterns(result, max_patterns=500)
-    dyn_idx = 0
+    dyn_idx = dyn_start_idx
     for seq, count, saving in dynamic:
         if seq in result:
-            # 分配动态标记（使用4字节标记）
+            # 分配动态标记（使用4字节标记），确保全局唯一
             marker = '\x02\x01' + struct.pack('>H', dyn_idx).decode('latin-1')
             dyn_idx += 1
             result = result.replace(seq, marker)
@@ -1042,7 +1049,7 @@ def replace_md_patterns(text):
                 used[marker] = (seq, 0)
             used[marker] = (used[marker][0], used[marker][1] + count)
     
-    return result, used
+    return result, used, dyn_idx
 
 
 def restore_md_patterns(text, pattern_map):
@@ -1251,23 +1258,28 @@ _MD_BLOCK_TYPES = {
 _MD_BLOCK_TYPE_NAMES = {v: k for k, v in _MD_BLOCK_TYPES.items()}
 
 
-def encode_md_stream(text, code_mapping=None):
+def encode_md_stream(text, code_mapping=None, dyn_start_idx=0):
     """
     将 Markdown 文本编码为分块压缩字节流。
 
     Args:
         text: MD原始文本
         code_mapping: 代码字典（用于代码块的token压缩）
+        dyn_start_idx: 动态标记起始索引（多文件压缩时递增避免冲突）
 
     Returns:
-        (bytes, used_patterns)
+        (bytes, used_patterns, latex_used, next_dyn_idx)
         bytes: 编码后的字节流
-        used_patterns: dict {marker: (orig, count)} 使用的模式
+        used_patterns: dict {marker: (orig, count)} 使用的MD模式
+        latex_used: dict {marker: (orig, count)} 使用的LaTeX常量
+        next_dyn_idx: 下一个可用的动态标记索引
     """
     blocks = parse_md_blocks(text)
 
     all_used_md_patterns = {}
+    all_latex_used = {}
     encoded_blocks = bytearray()
+    next_dyn_idx = dyn_start_idx
 
     for block in blocks:
         block_type = block[0]
@@ -1332,13 +1344,13 @@ def encode_md_stream(text, code_mapping=None):
                 s_b = s.encode('utf-8')
                 encoded_blocks.extend(struct.pack('>H', len(s_b)))
                 encoded_blocks.extend(s_b)
-            # LaTeX常量替换
+            # LaTeX常量替换（LaTeX常量标记以\x00开头，收集到latex_used）
             replaced, used = replace_latex_constants(content)
             for marker, info in used.items():
-                if marker not in all_used_md_patterns:
-                    all_used_md_patterns[marker] = info
+                if marker not in all_latex_used:
+                    all_latex_used[marker] = info
                 else:
-                    all_used_md_patterns[marker] = (info[0], all_used_md_patterns[marker][1] + info[1])
+                    all_latex_used[marker] = (info[0], all_latex_used[marker][1] + info[1])
             content_b = replaced.encode('utf-8')
             encoded_blocks.extend(struct.pack('>I', len(content_b)))
             encoded_blocks.extend(content_b)
@@ -1356,7 +1368,7 @@ def encode_md_stream(text, code_mapping=None):
             content = block[1]
             encoded_blocks.append(_MD_BLOCK_TYPES['text'])
             # MD模式替换 + LaTeX行内公式常量替换
-            replaced, used_md = replace_md_patterns(content)
+            replaced, used_md, next_dyn_idx = replace_md_patterns(content, next_dyn_idx)
             replaced, used_latex = replace_latex_constants(replaced)
 
             for marker, info in used_md.items():
@@ -1364,17 +1376,18 @@ def encode_md_stream(text, code_mapping=None):
                     all_used_md_patterns[marker] = info
                 else:
                     all_used_md_patterns[marker] = (info[0], all_used_md_patterns[marker][1] + info[1])
+            # 收集LaTeX常量
             for marker, info in used_latex.items():
-                if marker not in all_used_md_patterns:
-                    all_used_md_patterns[marker] = info
+                if marker not in all_latex_used:
+                    all_latex_used[marker] = info
                 else:
-                    all_used_md_patterns[marker] = (info[0], all_used_md_patterns[marker][1] + info[1])
+                    all_latex_used[marker] = (info[0], all_latex_used[marker][1] + info[1])
 
             content_b = replaced.encode('utf-8')
             encoded_blocks.extend(struct.pack('>I', len(content_b)))
             encoded_blocks.extend(content_b)
 
-    return bytes(encoded_blocks), all_used_md_patterns
+    return bytes(encoded_blocks), all_used_md_patterns, all_latex_used, next_dyn_idx
 
 
 def decode_md_stream(encoded, md_pattern_map=None, latex_const_map=None):
@@ -1429,11 +1442,11 @@ def decode_md_stream(encoded, md_pattern_map=None, latex_const_map=None):
             content = encoded[pos:pos+content_len].decode('utf-8')
             pos += content_len
 
-            # 恢复LaTeX常量（从md_pattern_map或latex_const_map）
-            if latex_const_map:
-                content = restore_latex_constants(content, latex_const_map)
+            # 恢复常量（先MD模式，再LaTeX，避免LaTeX的\x00标记误匹配MD标记中的子串）
             if md_pattern_map:
                 content = restore_md_patterns(content, md_pattern_map)
+            if latex_const_map:
+                content = restore_latex_constants(content, latex_const_map)
             result.append(f'{start_prefix}$${start_suffix}\n{content}\n{end_prefix}$${end_suffix}')
 
         elif block_name == 'table':
@@ -1452,11 +1465,11 @@ def decode_md_stream(encoded, md_pattern_map=None, latex_const_map=None):
             content = encoded[pos:pos+content_len].decode('utf-8')
             pos += content_len
 
-            # 恢复常量
-            if latex_const_map:
-                content = restore_latex_constants(content, latex_const_map)
+            # 恢复常量（先MD模式，再LaTeX，避免LaTeX的\x00标记误匹配MD标记中的子串）
             if md_pattern_map:
                 content = restore_md_patterns(content, md_pattern_map)
+            if latex_const_map:
+                content = restore_latex_constants(content, latex_const_map)
             result.append(content)
 
     return '\n'.join(result)

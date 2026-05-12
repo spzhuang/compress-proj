@@ -30,7 +30,7 @@ from pathlib import Path
 from util import (
     generate_short_names, get_index_bytes, pack_index,
     encode_png_to_stream, CODE_EXTENSIONS, BUILTINS_MAP, LANGUAGE_MAP,
-    replace_latex_constants, encode_latex_const_table,
+    replace_latex_constants, encode_latex_const_table, decode_latex_const_table,
     encode_md_stream, encode_md_pattern_table,
 )
 
@@ -656,10 +656,13 @@ def encode_md_files(sources, code_mapping=None):
     """
     encoded_streams = {}
     all_md_used = {}
+    all_latex_used = {}
+    dyn_idx = 0
 
     for fname, text in sources.items():
-        encoded, md_used = encode_md_stream(text, code_mapping=code_mapping)
+        encoded, md_used, latex_used, next_dyn_idx = encode_md_stream(text, code_mapping=code_mapping, dyn_start_idx=dyn_idx)
         encoded_streams[fname] = encoded
+        dyn_idx = next_dyn_idx
 
         # md_used 是 dict {marker: (orig, count)}
         if isinstance(md_used, dict):
@@ -668,9 +671,16 @@ def encode_md_files(sources, code_mapping=None):
                     all_md_used[marker] = info
                 else:
                     all_md_used[marker] = (info[0], all_md_used[marker][1] + info[1])
+        # 收集LaTeX常量
+        if isinstance(latex_used, dict):
+            for marker, info in latex_used.items():
+                if marker not in all_latex_used:
+                    all_latex_used[marker] = info
+                else:
+                    all_latex_used[marker] = (info[0], all_latex_used[marker][1] + info[1])
 
     md_const_binary = encode_md_pattern_table(all_md_used) if all_md_used else b''
-    return encoded_streams, md_const_binary
+    return encoded_streams, md_const_binary, all_latex_used
 
 
 # ============================================================
@@ -768,8 +778,22 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
     # Markdown 编码（分块压缩）
     md_encoded = {}
     md_const_binary = b''
+    md_latex_used = {}
     if md_sources:
-        md_encoded, md_const_binary = encode_md_files(md_sources, code_mapping=mapping)
+        md_encoded, md_const_binary, md_latex_used = encode_md_files(md_sources, code_mapping=mapping)
+    
+    # 合并 MD 文件中的 LaTeX 常量到 latex_const_binary
+    if md_latex_used:
+        if latex_const_binary:
+            # 解码现有的 LaTeX 常量表（{marker: orig}），转换为 {marker: (orig, 1)} 格式
+            existing = decode_latex_const_table(latex_const_binary)
+            merged = {marker: (orig, 1) for marker, orig in existing.items()}
+            for marker, info in md_latex_used.items():
+                if marker not in merged:
+                    merged[marker] = info
+            latex_const_binary = encode_latex_const_table(merged)
+        else:
+            latex_const_binary = encode_latex_const_table(md_latex_used)
 
     # 统一打包
     all_encoded = {**py_encoded, **code_encoded, **svg_encoded, **png_encoded, **latex_encoded, **md_encoded}
@@ -822,9 +846,120 @@ def pack_all_files(py_sources, code_sources, svg_sources, png_sources, latex_sou
     return compressed, png_psnr
 
 
+def parse_size(size_str):
+    """解析大小字符串，如 '30kb', '10mb', '5000' -> bytes"""
+    size_str = size_str.strip().lower()
+    multipliers = {'b': 1, 'kb': 1024, 'mb': 1024**2, 'gb': 1024**3}
+    for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
+        if size_str.endswith(suffix):
+            return int(float(size_str[:-len(suffix)]) * mult)
+    return int(size_str)
+
+
+def format_size(n):
+    """格式化字节数为人类可读格式"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def group_by_type(all_files):
+    """按类型分组文件，返回各类型字典"""
+    py = {k: v for k, v in all_files.items() if k.endswith('.py')}
+    svg = {k: v for k, v in all_files.items() if k.endswith('.svg')}
+    png = {k: v for k, v in all_files.items() if k.lower().endswith('.png')}
+    latex = {k: v for k, v in all_files.items() if k.endswith('.tex')}
+    md = {k: v for k, v in all_files.items() if k.endswith('.md') or k.endswith('.txt')}
+    code = {}
+    for fn, content in all_files.items():
+        ext = Path(fn).suffix.lower()
+        if ext in CODE_EXTENSIONS:
+            code[fn] = (content, LANGUAGE_MAP[ext], BUILTINS_MAP.get(ext, set()))
+    return py, code, svg, png, latex, md
+
+
+def filter_by_filetypes(all_files, filetypes_set):
+    """根据文件类型集合过滤文件"""
+    filtered = {}
+    for fn, content in all_files.items():
+        ext = Path(fn).suffix.lower()
+        # 匹配 .ext 或 ext 格式
+        if ext in filetypes_set or ext.lstrip('.') in filetypes_set:
+            filtered[fn] = content
+    return filtered
+
+
+def get_all_extensions(all_files):
+    """获取所有文件类型列表"""
+    exts = set()
+    for fn in all_files:
+        ext = Path(fn).suffix.lower()
+        if ext:
+            exts.add(ext)
+    return sorted(exts)
+
+
+def interactive_select_filetypes(all_files):
+    """交互式询问用户选择要压缩的文件类型"""
+    exts = get_all_extensions(all_files)
+    print(f"\n{'='*60}")
+    print("  文件类型选择")
+    print(f"{'='*60}")
+    print(f"\n  发现 {len(all_files)} 个文件，共 {len(exts)} 种类型:")
+    for i, ext in enumerate(exts, 1):
+        count = sum(1 for fn in all_files if Path(fn).suffix.lower() == ext)
+        print(f"    {i}. {ext}  ({count} 个文件)")
+    print(f"\n  操作说明:")
+    print(f"    - 输入 'all' 压缩所有文件类型")
+    print(f"    - 输入类型列表，如: py,js,md (用逗号分隔)")
+    print(f"    - 可带或不带点号，如 .py 和 py 均可")
+    print(f"{'='*60}")
+    while True:
+        choice = input("\n  请选择要压缩的文件类型: ").strip()
+        if not choice:
+            continue
+        if choice.lower() == 'all':
+            return set(exts)
+        selected = set()
+        valid = True
+        for ft in choice.split(','):
+            ft = ft.strip().lower()
+            if not ft.startswith('.'):
+                ft = '.' + ft
+            if ft in exts:
+                selected.add(ft)
+            else:
+                available = ', '.join(exts)
+                print(f"  错误: 不支持的类型 '{ft}'。可用类型: {available}")
+                valid = False
+                break
+        if valid and selected:
+            return selected
+
+
+def get_orig_size(all_files):
+    """计算原始文件总大小"""
+    total = 0
+    for fn, v in all_files.items():
+        if isinstance(v, str) and not v.startswith('/'):
+            total += len(v.encode('utf-8'))
+        elif isinstance(v, str):
+            total += Path(v).stat().st_size
+        else:
+            total += len(str(v).encode('utf-8'))
+    return total
+
+
+def compress_subset(py, code, svg, png, latex, md, output_path, clusters=16):
+    """压缩一组文件，返回压缩后字节和png_psnr"""
+    return pack_all_files(py, code, svg, png, latex, md, output_path, png_clusters=clusters)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Encoder V7 - 统一压缩工具 (PY/JS/C++/JAVA/SVG/PNG)'
+        description='Encoder V7 - 统一压缩工具 (PY/JS/C++/JAVA/SVG/PNG/MD/TXT)'
     )
     parser.add_argument('inputs', nargs='*', help='输入文件路径')
     parser.add_argument('-d', '--directory', metavar='DIR',
@@ -835,12 +970,17 @@ def main():
                         help='PNG 聚类簇数 (默认: 16)')
     parser.add_argument('--info', action='store_true',
                         help='显示 PNG 文件信息')
+    parser.add_argument('--maxsize', metavar='SIZE',
+                        help='单个压缩文件大小上限，如 30kb, 5mb (超出10%容忍)')
+    parser.add_argument('--filetypes', metavar='TYPES',
+                        help='指定压缩的文件类型，逗号分隔，如 py,js,md (不指定则交互询问)')
 
     args = parser.parse_args()
 
     if args.info:
         if args.inputs:
             from PIL import Image
+            import numpy as np
             for f in args.inputs:
                 p = Path(f)
                 if p.suffix.lower() == '.png':
@@ -852,7 +992,9 @@ def main():
                     print(f"{p.name}: {p.stat().st_size} bytes")
         return
 
-    # 收集源文件
+    # ============================================================
+    #  1. 收集源文件
+    # ============================================================
     supported_exts = ('.py', '.svg', '.png', '.tex', '.md', '.txt') + tuple(CODE_EXTENSIONS)
 
     if args.directory:
@@ -865,7 +1007,7 @@ def main():
         for p in sorted(input_path.rglob('*')):
             if p.is_file() and p.suffix.lower() in supported_exts:
                 if p.suffix.lower() == '.png':
-                    all_files[p.name] = str(p)  # PNG 存路径
+                    all_files[p.name] = str(p)
                 else:
                     all_files[p.name] = p.read_text(encoding='utf-8')
 
@@ -899,67 +1041,148 @@ def main():
 
         base_name = Path(args.inputs[0]).stem
 
-    # 按类型分组
-    py_sources = {k: v for k, v in all_files.items() if k.endswith('.py')}
-    svg_sources = {k: v for k, v in all_files.items() if k.endswith('.svg')}
-    png_sources = {k: v for k, v in all_files.items() if k.lower().endswith('.png')}
-    latex_sources = {k: v for k, v in all_files.items() if k.endswith('.tex')}
-    md_sources = {k: v for k, v in all_files.items() if k.endswith('.md') or k.endswith('.txt')}
+    # ============================================================
+    #  2. 处理 --filetypes 参数（必需，不指定则交互询问）
+    # ============================================================
+    if args.filetypes:
+        selected_types = set()
+        for ft in args.filetypes.split(','):
+            ft = ft.strip().lower()
+            if not ft.startswith('.'):
+                ft = '.' + ft
+            selected_types.add(ft)
+        # 过滤
+        before = len(all_files)
+        all_files = filter_by_filetypes(all_files, selected_types)
+        after = len(all_files)
+        print(f"  文件类型过滤: {before} -> {after} 个文件")
+        if not all_files:
+            available = ', '.join(get_all_extensions({k: v for k, v in {
+                fn: c for fn, c in [(fn, all_files.get(fn)) for fn in all_files]
+            }.items()}))
+            print(f"Error: 过滤后无文件。可用类型: {available}")
+            sys.exit(1)
+    else:
+        # 交互式询问
+        selected_types = interactive_select_filetypes(all_files)
+        all_files = filter_by_filetypes(all_files, selected_types)
+        print(f"  已选择类型: {', '.join(sorted(selected_types))}")
+        print(f"  过滤后文件数: {len(all_files)}")
 
-    # 通用代码文件分组
-    code_sources = {}
-    for fname, content in all_files.items():
-        ext = Path(fname).suffix.lower()
-        if ext in CODE_EXTENSIONS:
-            kw_set, bi_set = LANGUAGE_MAP[ext], BUILTINS_MAP.get(ext, set())
-            code_sources[fname] = (content, kw_set, bi_set)
+    # ============================================================
+    #  3. 按类型分组
+    # ============================================================
+    py_sources, code_sources, svg_sources, png_sources, latex_sources, md_sources = group_by_type(all_files)
 
     # 确定输出路径
     if args.output:
         output_dir = Path(args.output)
     else:
         output_dir = Path('compress') / base_name
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{base_name}.compress"
 
-    # 打包
-    compressed, png_psnr = pack_all_files(
-        py_sources, code_sources, svg_sources, png_sources, latex_sources,
-        md_sources, output_path, png_clusters=args.clusters
-    )
+    # ============================================================
+    #  4. 处理 --maxsize 参数（自动拆分压缩）
+    # ============================================================
+    orig_size = get_orig_size(all_files)
 
-    # 统计（按扩展名区分内容和路径）
-    orig_size = 0
-    for fname, v in all_files.items():
-        if fname.lower().endswith('.png'):
-            orig_size += Path(v).stat().st_size
-        else:
-            orig_size += len(v.encode('utf-8'))
+    if args.maxsize:
+        max_bytes = parse_size(args.maxsize)
+        max_with_tolerance = int(max_bytes * 1.1)  # 10% 容忍
+        print(f"\n  最大压缩文件大小: {format_size(max_bytes)} (容忍上限: {format_size(max_with_tolerance)})")
 
-    print(f"\n{'='*50}")
-    print("   Compression Results")
-    print(f"{'='*50}")
-    print(f"  Original:   {orig_size:,} bytes")
-    print(f"  Compressed: {len(compressed):,} bytes ({len(compressed)/orig_size*100:.1f}%)")
-    print(f"  Ratio:      {orig_size/len(compressed):.1f}x")
-    print(f"  Output:     {output_path}")
+        # 逐个文件尝试压缩，直到超出上限
+        file_list = list(all_files.items())
+        part_num = 1
+        remaining_files = dict(file_list)
+        total_compressed = 0
 
-    if py_sources:
-        print(f"\n  Python: {len(py_sources)} files")
-    if code_sources:
-        langs = sorted(set(str(Path(k).suffix).lower() for k in code_sources))
-        print(f"  Code:   {len(code_sources)} files ({', '.join(langs)})")
-    if svg_sources:
-        print(f"  SVG:    {len(svg_sources)} files")
-    if png_sources:
-        for fname, psnr in png_psnr.items():
-            print(f"  PNG:    {fname} (PSNR={psnr:.1f}dB, K={args.clusters})")
-    if latex_sources:
-        print(f"  LaTeX:  {len(latex_sources)} files")
-    if md_sources:
-        print(f"  MD:     {len(md_sources)} files (block-level compression)")
-    print(f"{'='*50}")
+        while remaining_files:
+            part_files = {}
+            part_remaining = dict(remaining_files)
+
+            # 逐个添加文件，检查大小
+            for fn, content in list(remaining_files.items()):
+                trial_files = dict(part_files)
+                trial_files[fn] = content
+                py, code, svg, png, latex, md = group_by_type(trial_files)
+                tmp_path = output_dir / f"{base_name}_part{part_num}.compress"
+                try:
+                    compressed, _ = compress_subset(py, code, svg, png, latex, md, tmp_path, args.clusters)
+                except Exception as e:
+                    print(f"  警告: 压缩失败 {fn}: {e}")
+                    part_remaining.pop(fn, None)
+                    continue
+
+                if len(compressed) <= max_with_tolerance or not part_files:
+                    # 可以容纳
+                    part_files[fn] = content
+                    part_remaining.pop(fn, None)
+                else:
+                    # 超出上限且不是第一个文件，停止添加
+                    break
+
+            if not part_files:
+                # 单个文件就超出上限，只能单独压缩
+                fn, content = list(part_remaining.items())[0]
+                part_files[fn] = content
+                part_remaining.pop(fn)
+
+            # 压缩这一批
+            py, code, svg, png, latex, md = group_by_type(part_files)
+            output_path = output_dir / f"{base_name}_part{part_num}.compress"
+            compressed, png_psnr = compress_subset(py, code, svg, png, latex, md, output_path, args.clusters)
+            total_compressed += len(compressed)
+
+            # 统计
+            part_orig = get_orig_size(part_files)
+            print(f"\n  Part {part_num}: {len(part_files)} 个文件")
+            print(f"    原始: {format_size(part_orig)} -> 压缩: {format_size(len(compressed))} ({len(compressed)/part_orig*100:.1f}%)")
+
+            remaining_files = part_remaining
+            part_num += 1
+
+        print(f"\n{'='*50}")
+        print("   Compression Results (Multi-Part)")
+        print(f"{'='*50}")
+        print(f"  Original:   {format_size(orig_size)}")
+        print(f"  Compressed: {format_size(total_compressed)} ({total_compressed/orig_size*100:.1f}%)")
+        print(f"  Ratio:      {orig_size/total_compressed:.1f}x")
+        print(f"  Parts:      {part_num - 1} 个压缩文件")
+        print(f"  Output:     {output_dir}")
+        print(f"{'='*50}")
+
+    else:
+        # 普通单文件压缩
+        output_path = output_dir / f"{base_name}.compress"
+        compressed, png_psnr = compress_subset(
+            py_sources, code_sources, svg_sources, png_sources, latex_sources, md_sources,
+            output_path, args.clusters
+        )
+
+        print(f"\n{'='*50}")
+        print("   Compression Results")
+        print(f"{'='*50}")
+        print(f"  Original:   {format_size(orig_size)}")
+        print(f"  Compressed: {format_size(len(compressed))} ({len(compressed)/orig_size*100:.1f}%)")
+        print(f"  Ratio:      {orig_size/len(compressed):.1f}x")
+        print(f"  Output:     {output_path}")
+
+        if py_sources:
+            print(f"\n  Python: {len(py_sources)} files")
+        if code_sources:
+            langs = sorted(set(str(Path(k).suffix).lower() for k in code_sources))
+            print(f"  Code:   {len(code_sources)} files ({', '.join(langs)})")
+        if svg_sources:
+            print(f"  SVG:    {len(svg_sources)} files")
+        if png_sources:
+            for fname, psnr in png_psnr.items():
+                print(f"  PNG:    {fname} (PSNR={psnr:.1f}dB, K={args.clusters})")
+        if latex_sources:
+            print(f"  LaTeX:  {len(latex_sources)} files")
+        if md_sources:
+            print(f"  MD:     {len(md_sources)} files (block-level compression)")
+        print(f"{'='*50}")
 
 
 if __name__ == '__main__':
