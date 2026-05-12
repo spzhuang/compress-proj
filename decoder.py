@@ -379,15 +379,112 @@ def restore_generic_lines(lines):
 #  统一解包
 # ============================================================
 
+def _parse_type_suffix(filename):
+    """从文件名解析压缩类型后缀，如 'test_py_md.compress' -> ['py', 'md']
+    
+    支持的文件名格式:
+      - src.compress          -> None (无后缀，导入全部)
+      - src_py.compress       -> ['py']
+      - src_py_md.compress    -> ['py', 'md']
+      - src_all.compress      -> ['all']
+      - src_part1_md.compress -> ['md'] (跳过 partN 前缀)
+    """
+    # 去掉 .compress 后缀
+    name = filename
+    if name.endswith('.compress'):
+        name = name[:-9]
+    
+    # 查找最后一个 _ 开始的后缀部分
+    # 但需要跳过 _partN 前缀
+    # 策略：找到 _all, 或找到第一个已知类型前缀
+    KNOWN_TYPES = {'py', 'js', 'ts', 'java', 'go', 'rs', 'cpp', 'c', 'h',
+                   'sh', 'svg', 'png', 'tex', 'md', 'txt', 'all'}
+    
+    # 从后向前查找，找到第一个已知类型
+    parts = name.split('_')
+    types = []
+    found_type = False
+    for part in reversed(parts):
+        if part in KNOWN_TYPES:
+            types.append(part)
+            found_type = True
+        elif found_type:
+            # 已经找到类型，但当前 part 不是类型，停止
+            break
+        # 如果还没找到类型，继续向前搜索（跳过 part1, part2 等）
+    
+    if not types:
+        return None  # 没有找到类型后缀，导入全部
+    
+    types.reverse()  # 恢复原始顺序
+    return types
+
+
+def _import_decoder_modules(type_list):
+    """根据文件类型列表按需导入解码模块"""
+    modules = {'base': True, 'svg': False, 'png': False, 'latex': False, 'md': False}
+    
+    if type_list is None or 'all' in type_list:
+        # 导入所有模块
+        modules = {k: True for k in modules}
+    else:
+        # 按需标记
+        for t in type_list:
+            if t in ('py', 'js', 'ts', 'c', 'cpp', 'java', 'go', 'rs', 'sh'):
+                modules['base'] = True
+            elif t == 'svg':
+                modules['svg'] = True
+            elif t == 'png':
+                modules['png'] = True
+            elif t == 'tex':
+                modules['latex'] = True
+            elif t in ('md', 'txt'):
+                modules['md'] = True
+    
+    result = {}
+    
+    # base 始终需要（read_index, decode_dict 等）
+    if modules['base'] or True:
+        result['base'] = True
+    
+    if modules['png']:
+        from util_svg_png import decode_png_from_stream
+        result['decode_png'] = decode_png_from_stream
+    
+    if modules['latex']:
+        from util_latex import restore_latex_constants, decode_latex_const_table
+        result['restore_latex'] = restore_latex_constants
+        result['decode_latex_table'] = decode_latex_const_table
+    else:
+        result['restore_latex'] = lambda text, cmap: text
+        result['decode_latex_table'] = lambda data: {}
+    
+    if modules['md']:
+        from util_md_stream import decode_md_stream, _MD_BLOCK_TYPE_NAMES
+        from util_md_patterns import restore_md_patterns, decode_md_pattern_table
+        result['decode_md_stream'] = decode_md_stream
+        result['restore_md'] = restore_md_patterns
+        result['decode_md_table'] = decode_md_pattern_table
+        result['md_block_names'] = _MD_BLOCK_TYPE_NAMES
+    
+    return result
+
+
 def decode_files(compress_path):
     """
     从压缩文件解码所有源文件。
+    根据文件名后缀（如 .compress_py_md）按需导入解码模块。
 
     Returns:
         dict: {filename: (file_type, content)}
             file_type: 'source'  -> str (Python/SVG/LaTeX source)
                        'image'   -> PIL Image (PNG)
     """
+    # 1. 从文件名解析类型，按需导入模块
+    filename = os.path.basename(compress_path)
+    type_list = _parse_type_suffix(filename)
+    modules = _import_decoder_modules(type_list)
+    
     with open(compress_path, 'rb') as f:
         compressed = f.read()
 
@@ -452,19 +549,30 @@ def decode_files(compress_path):
             source = restore_generic_lines(lines)
             results[fname] = ('source', source)
         elif file_type == 's':
+            # SVG: 直接解码为 UTF-8 文本
             source = encoded.decode('utf-8')
             results[fname] = ('source', source)
         elif file_type == 'g':
-            image = decode_png_from_stream(encoded)
+            # PNG: 按需解码
+            if 'decode_png' in modules:
+                image = modules['decode_png'](encoded)
+            else:
+                raise ValueError("PNG解码模块未加载，请使用后缀 .compress_png")
             results[fname] = ('image', image)
         elif file_type == 'l':
             text = encoded.decode('utf-8')
             if latex_const_map:
-                text = restore_latex_constants(text, latex_const_map)
+                text = modules['restore_latex'](text, latex_const_map)
             results[fname] = ('source', text)
         elif file_type == 'm':
-            # Markdown 分块压缩解码
-            text = decode_md_stream(encoded, md_pattern_map=md_pattern_map, latex_const_map=latex_const_map)
+            # Markdown 分块压缩解码: 按需解码
+            if 'decode_md_stream' in modules:
+                text = modules['decode_md_stream'](
+                    encoded, md_pattern_map=md_pattern_map,
+                    latex_const_map=latex_const_map
+                )
+            else:
+                text = encoded.decode('utf-8')
             results[fname] = ('source', text)
         else:
             raise ValueError(f"未知文件类型: {file_type}")

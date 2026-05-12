@@ -881,11 +881,18 @@ def group_by_type(all_files):
 
 
 def filter_by_filetypes(all_files, filetypes_set):
-    """根据文件类型集合过滤文件"""
+    """根据文件类型集合过滤文件
+    filetypes_set 中的元素以 '.' 开头，如 {'.md', '.py'}
+    如果包含 'all' 或 '.all'，则不过滤
+    """
+    if not filetypes_set:
+        return all_files
+    # 处理 'all' 或 '.all'
+    if 'all' in filetypes_set or '.all' in filetypes_set:
+        return all_files
     filtered = {}
     for fn, content in all_files.items():
         ext = Path(fn).suffix.lower()
-        # 匹配 .ext 或 ext 格式
         if ext in filetypes_set or ext.lstrip('.') in filetypes_set:
             filtered[fn] = content
     return filtered
@@ -937,6 +944,22 @@ def interactive_select_filetypes(all_files):
                 break
         if valid and selected:
             return selected
+
+
+def get_compress_suffix(needs):
+    """根据压缩类型列表生成压缩文件后缀
+    
+    Args:
+        needs: 文件类型列表，如 ['py', 'md', 'svg']
+    
+    Returns:
+        后缀字符串，如 '_py', '_py_md', '_all'
+    """
+    if not needs or 'all' in needs:
+        return '_all'
+    # 排序保证一致性
+    sorted_needs = sorted(set(needs))
+    return '_' + '_'.join(sorted_needs)
 
 
 def get_orig_size(all_files):
@@ -1051,6 +1074,7 @@ def main():
             if not ft.startswith('.'):
                 ft = '.' + ft
             selected_types.add(ft)
+        needs = {t.lstrip('.') for t in selected_types}
         # 过滤
         before = len(all_files)
         all_files = filter_by_filetypes(all_files, selected_types)
@@ -1064,9 +1088,9 @@ def main():
             sys.exit(1)
     else:
         # 交互式询问
-        selected_types = interactive_select_filetypes(all_files)
-        all_files = filter_by_filetypes(all_files, selected_types)
-        print(f"  已选择类型: {', '.join(sorted(selected_types))}")
+        needs = interactive_select_filetypes(all_files)
+        all_files = filter_by_filetypes(all_files, needs)
+        print(f"  已选择类型: {', '.join(sorted(needs))}")
         print(f"  过滤后文件数: {len(all_files)}")
 
     # ============================================================
@@ -1106,7 +1130,8 @@ def main():
                 trial_files = dict(part_files)
                 trial_files[fn] = content
                 py, code, svg, png, latex, md = group_by_type(trial_files)
-                tmp_path = output_dir / f"{base_name}_part{part_num}.compress"
+                suffix = get_compress_suffix(needs)
+                tmp_path = output_dir / f"{base_name}_part{part_num}{suffix}.compress"
                 try:
                     compressed, _ = compress_subset(py, code, svg, png, latex, md, tmp_path, args.clusters)
                 except Exception as e:
@@ -1154,7 +1179,8 @@ def main():
 
     else:
         # 普通单文件压缩
-        output_path = output_dir / f"{base_name}.compress"
+        suffix = get_compress_suffix(needs)
+        output_path = output_dir / f"{base_name}{suffix}.compress"
         compressed, png_psnr = compress_subset(
             py_sources, code_sources, svg_sources, png_sources, latex_sources, md_sources,
             output_path, args.clusters
