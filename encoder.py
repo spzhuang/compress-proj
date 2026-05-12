@@ -1116,6 +1116,10 @@ def main():
         print(f"\n  最大压缩文件大小: {format_size(max_bytes)} (容忍上限: {format_size(max_with_tolerance)})")
 
         # 逐个文件尝试压缩，直到超出上限
+        # 使用临时目录进行大小测试，避免污染输出目录
+        import tempfile
+        tmp_dir = Path(tempfile.mkdtemp(prefix='compress_test_'))
+        
         file_list = list(all_files.items())
         part_num = 1
         remaining_files = dict(file_list)
@@ -1130,10 +1134,10 @@ def main():
                 trial_files = dict(part_files)
                 trial_files[fn] = content
                 py, code, svg, png, latex, md = group_by_type(trial_files)
-                suffix = get_compress_suffix(needs)
-                tmp_path = output_dir / f"{base_name}_part{part_num}{suffix}.compress"
+                # 测试时使用临时路径，不写入输出目录
+                test_path = tmp_dir / f"test_part{part_num}.compress"
                 try:
-                    compressed, _ = compress_subset(py, code, svg, png, latex, md, tmp_path, args.clusters)
+                    compressed, _ = compress_subset(py, code, svg, png, latex, md, test_path, args.clusters)
                 except Exception as e:
                     print(f"  警告: 压缩失败 {fn}: {e}")
                     part_remaining.pop(fn, None)
@@ -1153,9 +1157,10 @@ def main():
                 part_files[fn] = content
                 part_remaining.pop(fn)
 
-            # 压缩这一批
+            # 压缩这一批，写入最终输出目录（带类型后缀）
             py, code, svg, png, latex, md = group_by_type(part_files)
-            output_path = output_dir / f"{base_name}_part{part_num}.compress"
+            suffix = get_compress_suffix(needs)
+            output_path = output_dir / f"{base_name}_part{part_num}{suffix}.compress"
             compressed, png_psnr = compress_subset(py, code, svg, png, latex, md, output_path, args.clusters)
             total_compressed += len(compressed)
 
@@ -1166,6 +1171,10 @@ def main():
 
             remaining_files = part_remaining
             part_num += 1
+        
+        # 清理临时目录
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
         print(f"\n{'='*50}")
         print("   Compression Results (Multi-Part)")
